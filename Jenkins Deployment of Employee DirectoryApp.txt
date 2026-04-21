@@ -1,0 +1,816 @@
+Jenkins Deployment of Employee Directory App
+==================================================
+https://github.com/KastroVKiran/3Tier-Microservices-App.git
+
+Setup Cluster as done in JDKT Batches
+
+Install Jenkins on VM
+
+Install Docker on VM
+
+Install HELM on VM
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+Install EBS CSI Driver
+Attach the IAM policy to the worker node group IAM Role, then install the driver via Helm.
+Policy Name: AmazonEBSCSIDriverPolicy
+
+#  Get your cluster's OIDC issuer and enable OIDC
+eksctl utils associate-iam-oidc-provider \
+  --region ap-south-1 \
+  --cluster kastro-cluster \
+  --approve
+
+# Create IAM service account for EBS CSI driver
+eksctl create iamserviceaccount \
+  --name ebs-csi-controller-sa \
+  --namespace kube-system \
+  --cluster kastro-cluster \
+  --region ap-south-1 \
+  --attach-policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy \
+  --approve \
+  --role-only \
+  --role-name AmazonEKS_EBS_CSI_DriverRole
+
+# Get your AWS account ID
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo $ACCOUNT_ID
+
+# Add the EBS CSI driver addon to EKS
+aws eks create-addon \
+  --cluster-name kastro-cluster \
+  --addon-name aws-ebs-csi-driver \
+  --region ap-south-1 \
+  --service-account-role-arn arn:aws:iam::${ACCOUNT_ID}:role/AmazonEKS_EBS_CSI_DriverRole
+
+# Verify addon is ACTIVE
+aws eks describe-addon \
+  --cluster-name kastro-cluster \
+  --addon-name aws-ebs-csi-driver \
+  --region ap-south-1 \
+  --query 'addon.status'
+
+# Should print: "ACTIVE"
+kubectl get pods -n kube-system | grep ebs
+
+— Install AWS Load Balancer Controller
+# Download IAM policy for the LB controller
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+
+# Create the IAM policy
+aws iam create-policy \
+  --policy-name AWSLoadBalancerControllerIAMPolicy \
+  --policy-document file://iam_policy.json
+
+Note the Policy ARN from above command
+
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+eksctl create iamserviceaccount \
+  --cluster kastro-cluster \
+  --namespace kube-system \
+  --name aws-load-balancer-controller \
+  --region ap-south-1 \
+  --attach-policy-arn arn:aws:iam::${ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
+  --approve
+
+# Add the EKS Helm chart repo
+helm repo add eks https://aws.github.io/eks-charts
+helm repo update
+
+# Get your VPC ID
+VPC_ID=$(aws eks describe-cluster \
+  --name kastro-cluster \
+  --region ap-south-1 \
+  --query 'cluster.resourcesVpcConfig.vpcId' \
+  --output text)
+echo "VPC ID: $VPC_ID"
+
+# Install the controller
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system \
+  --set clusterName=kastro-cluster \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set region=ap-south-1 \
+  --set vpcId=$VPC_ID
+
+# Verify controller pods are running
+kubectl get deployment -n kube-system aws-load-balancer-controller
+kubectl get pods -n kube-system | grep aws-load-balancer
+
+# Install Below Plugins in Jenkins
+Docker Pipeline
+Kubernetes CLI
+SSH Agent
+
+# Credentials Configuration
+"docker-creds"
+
+Add kube-config in Jenkins
+On VM ----> cat ~/.kube/config ----> Save this data to a file called "kubeconfig" (Any name can be given) on local laptop
+Go to:
+Jenkins Dashboard → Manage Jenkins → Credentials → (global)
+Add Credentials
+Kind: Secret file
+Upload file:
+Either upload ~/.kube/config
+OR paste and save as file
+ID: kubeconfig
+👉 IMPORTANT: ID must match your pipeline
+
+Why we need to do this?
+Jenkins VM does NOT know:
+	which Kubernetes cluster to connect to ❌
+	how to authenticate ❌
+	where your EKS API server is ❌
+👉 Solution:
+kubeconfig acts like a connection + authentication file
+
+Alternatively, we can use IRSA for this setup. But lets stick to kubeconfig file itself.
+
+# Permissions to Jenkins to work with Docker
+sudo usermod -aG docker jenkins
+sudo systemctl restart jenkins
+sudo systemctl restart docker
+
+# Final Jenkins Pipeline
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_USER = "kastrov"
+        EMP_IMAGE = "employee-svc"
+        DEPT_IMAGE = "dept-svc"
+        FRONTEND_IMAGE = "emp-frontend"
+        K8S_NAMESPACE = "employee-dir"
+        VERSION = "${BUILD_NUMBER}"
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git 'https://github.com/KastroVKiran/3Tier-Microservices-App.git'
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                sh '''
+                docker build -t $DOCKER_USER/$EMP_IMAGE:$VERSION backend-employee
+                docker build -t $DOCKER_USER/$DEPT_IMAGE:$VERSION backend-department
+                docker build -t $DOCKER_USER/$FRONTEND_IMAGE:$VERSION frontend
+                '''
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh 'echo $PASS | docker login -u $USER --password-stdin'
+                }
+            }
+        }
+
+        stage('Push Images') {
+            steps {
+                sh '''
+                docker push $DOCKER_USER/$EMP_IMAGE:$VERSION
+                docker push $DOCKER_USER/$DEPT_IMAGE:$VERSION
+                docker push $DOCKER_USER/$FRONTEND_IMAGE:$VERSION
+                '''
+            }
+        }
+
+        // ✅ Base Infra Deployment
+        stage('Deploy Base Resources to EKS') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl apply -f k8s/namespace.yaml
+                    kubectl apply -f k8s/storageclass.yaml
+                    kubectl apply -f k8s/mongo-secret.yaml
+                    kubectl apply -f k8s/mongo-service.yaml
+                    kubectl apply -f k8s/mongo-statefulset.yaml
+                    kubectl apply -f k8s/employee-deploy.yaml
+                    kubectl apply -f k8s/dept-deploy.yaml
+                    kubectl apply -f k8s/frontend-deploy.yaml
+                    '''
+                }
+            }
+        }
+
+        // ✅ Apply NEW Domain + SSL Ingress
+        stage('Deploy Domain Ingress (SSL)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl apply -f k8s/domain-ingress.yml
+                    '''
+                }
+            }
+        }
+
+        // ✅ Update Images
+        stage('Deploy to EKS (Update Image)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl set image deployment/employee-svc employee-svc=$DOCKER_USER/$EMP_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    kubectl set image deployment/dept-svc dept-svc=$DOCKER_USER/$DEPT_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    kubectl set image deployment/frontend frontend=$DOCKER_USER/$FRONTEND_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        // ✅ Verify Deployment
+        stage('Verify Rollout') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl rollout status deployment/employee-svc -n $K8S_NAMESPACE
+                    kubectl rollout status deployment/dept-svc -n $K8S_NAMESPACE
+                    kubectl rollout status deployment/frontend -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        // ✅ Verify Ingress + Domain
+        stage('Verify Domain & Ingress') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl get ingress -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Deployment Successful with Domain + SSL! Version: ${VERSION}"
+        }
+        failure {
+            echo "❌ Deployment Failed! Rolling back..."
+
+            withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                sh '''
+                kubectl rollout undo deployment/employee-svc -n $K8S_NAMESPACE || true
+                kubectl rollout undo deployment/dept-svc -n $K8S_NAMESPACE || true
+                kubectl rollout undo deployment/frontend -n $K8S_NAMESPACE || true
+                '''
+            }
+        }
+    }
+}
+# Access the resources - Verify everything is running
+# Check all pods
+kubectl get pods -n employee-dir
+
+# Check services
+kubectl get svc -n employee-dir
+
+# Check StatefulSet
+kubectl get statefulset -n employee-dir
+
+# Check PVCs (EBS volumes)
+kubectl get pvc -n employee-dir
+
+# Get the ALB DNS name (wait ~2-3 mins after ingress apply)
+kubectl get ingress -n employee-dir
+
+# Check pod logs
+kubectl logs -f deployment/employee-svc -n employee-dir
+kubectl logs -f deployment/dept-svc -n employee-dir
+kubectl logs -f deployment/frontend -n employee-dir
+
+Enter the data by adding employees (No need to select dept)
+
+How to verify data in MongoDB (VERY IMPORTANT)
+🔥 Step 1 — Access Mongo pod
+kubectl exec -it mongo-0 -n employee-dir -- mongosh
+
+🔥 Step 2 — Switch DB
+use employeedb
+
+🔥 Step 3 — List collections
+show collections
+👉 Expected:
+employees
+departments
+
+🔥 Step 4 — View data
+Employees:
+db.employees.find().pretty()
+
+Departments:
+db.departments.find().pretty()
+
+===========================
+Lets do domain configuration with path based routing;
+You will access:
+https://learndevops01.click
+https://learndevops01.click/api/employees
+https://learndevops01.click/api/departments
+
+🚀 STEP 1: Create SSL Certificate (ACM)
+Go to:
+👉 AWS Console → Certificate Manager (ACM)
+👉 Region: ap-south-1 (VERY IMPORTANT)
+➕ Request Certificate
+Type: Public certificate
+Domain name:
+learndevops01.click
+👉 Also add:
+*.learndevops01.click
+Validation: DNS validation ✅
+
+🔹 Create record in Route53
+ACM will show:
+👉 “Create record in Route53”
+Click:
+Create records in Route 53
+⏳ Wait
+Status should become:
+Issued ✅
+
+Copy the Certificate ARN
+arn:aws:acm:ap-south-1:560185625463:certificate/1c75eaa2-616f-42d7-8733-b72941229fe4
+
+Go to: 👉 Route53 → Hosted Zones → learndevops01.click
+✅ Create Record
+Fill like this:
+Record type → A
+Record name → (leave empty) OR @
+Alias → ✅ Enable
+Alias target → select your ALB
+
+🚀 STEP 2: Update Ingress for HTTPS
+Save the below ingress with new name as "k8s/domain-ingress.yml" in GitHub repo
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: emp-dir-ingress
+  namespace: employee-dir
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # ✅ HTTPS LISTENER
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+
+    # ✅ SSL CERTIFICATE
+    alb.ingress.kubernetes.io/certificate-arn: <PASTE_YOUR_CERT_ARN>
+
+    # ✅ FORCE HTTPS
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+
+spec:
+  ingressClassName: alb
+
+  rules:
+    - host: learndevops01.click
+      http:
+        paths:
+          - path: /api/employees
+            pathType: Prefix
+            backend:
+              service:
+                name: employee-svc
+                port:
+                  number: 5001
+
+          - path: /api/departments
+            pathType: Prefix
+            backend:
+              service:
+                name: dept-svc
+                port:
+                  number: 5002
+
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend-svc
+                port:
+                  number: 80
+
+
+Create a new pipeline job in Jenkins as "domain-job" and paste the below pipeline script
+
+pipeline {
+    agent any
+
+    environment {
+        DOCKER_USER = "kastrov"
+        EMP_IMAGE = "employee-svc"
+        DEPT_IMAGE = "dept-svc"
+        FRONTEND_IMAGE = "emp-frontend"
+        K8S_NAMESPACE = "employee-dir"
+        VERSION = "${BUILD_NUMBER}"
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                git 'https://github.com/KastroVKiran/3Tier-Microservices-App.git'
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                sh '''
+                docker build -t $DOCKER_USER/$EMP_IMAGE:$VERSION backend-employee
+                docker build -t $DOCKER_USER/$DEPT_IMAGE:$VERSION backend-department
+                docker build -t $DOCKER_USER/$FRONTEND_IMAGE:$VERSION frontend
+                '''
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'docker-creds', usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+                    sh 'echo $PASS | docker login -u $USER --password-stdin'
+                }
+            }
+        }
+
+        stage('Push Images') {
+            steps {
+                sh '''
+                docker push $DOCKER_USER/$EMP_IMAGE:$VERSION
+                docker push $DOCKER_USER/$DEPT_IMAGE:$VERSION
+                docker push $DOCKER_USER/$FRONTEND_IMAGE:$VERSION
+                '''
+            }
+        }
+
+        // ✅ Base Infra Deployment
+        stage('Deploy Base Resources to EKS') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl apply -f k8s/namespace.yaml
+                    kubectl apply -f k8s/storageclass.yaml
+                    kubectl apply -f k8s/mongo-secret.yaml
+                    kubectl apply -f k8s/mongo-service.yaml
+                    kubectl apply -f k8s/mongo-statefulset.yaml
+                    kubectl apply -f k8s/employee-deploy.yaml
+                    kubectl apply -f k8s/dept-deploy.yaml
+                    kubectl apply -f k8s/frontend-deploy.yaml
+                    '''
+                }
+            }
+        }
+
+        // ✅ Apply NEW Domain + SSL Ingress
+        stage('Deploy Domain Ingress (SSL)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl apply -f k8s/domain-ingress.yml
+                    '''
+                }
+            }
+        }
+
+        // ✅ Update Images
+        stage('Deploy to EKS (Update Image)') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl set image deployment/employee-svc employee-svc=$DOCKER_USER/$EMP_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    kubectl set image deployment/dept-svc dept-svc=$DOCKER_USER/$DEPT_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    kubectl set image deployment/frontend frontend=$DOCKER_USER/$FRONTEND_IMAGE:$VERSION -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        // ✅ Verify Deployment
+        stage('Verify Rollout') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl rollout status deployment/employee-svc -n $K8S_NAMESPACE
+                    kubectl rollout status deployment/dept-svc -n $K8S_NAMESPACE
+                    kubectl rollout status deployment/frontend -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+
+        // ✅ Verify Ingress + Domain
+        stage('Verify Domain & Ingress') {
+            steps {
+                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                    sh '''
+                    kubectl get ingress -n $K8S_NAMESPACE
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ Deployment Successful with Domain + SSL! Version: ${VERSION}"
+        }
+        failure {
+            echo "❌ Deployment Failed! Rolling back..."
+
+            withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+                sh '''
+                kubectl rollout undo deployment/employee-svc -n $K8S_NAMESPACE || true
+                kubectl rollout undo deployment/dept-svc -n $K8S_NAMESPACE || true
+                kubectl rollout undo deployment/frontend -n $K8S_NAMESPACE || true
+                '''
+            }
+        }
+    }
+}
+
+======================
+Now lets setup ArgoCD
+
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
+
+In production, it is always suggested to create a custom namespace ----> kubectl create namespace argocd ----> Lets install argocd in the namespace 'argocd' ----> helm install argocd argo/argo-cd --namespace argocd ----> kubectl get all -n argocd ----> You will see multiple things which are running ----> Under 'services' you can see 'argo-cd server' and the type as ClusterIP. But to access outside of the cluster, we need Load Balancer. So lets edit this ClusterIP to LoadBalancer ----> For this i will use patch ----> 
+
+EXPOSE ARGOCD SERVER:
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "LoadBalancer"}}' ----> kubectl get all -n argocd ----> Now you can see the service called 'argo-cd server' changed to Load Balancer instead of ClusterIP ----> Copy the load balancer url ----> This is one way of getting the loadbalancer url. Another way is to install "jq" (J Query) ----> 
+
+yum install jq -y
+
+kubectl get svc argocd-server -n argocd -o json | jq --raw-output '.status.loadBalancer.ingress[0].hostname'
+The above command will provide load balancer URL to access ARGO CD
+
+Access the argocd using teh above load balancer url ----> Username: admin, 
+
+TO GET ARGO CD PASSWORD:
+------------------------------------------
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+----> Copy the password and provide in argo cd console ----> You will see the argo cd console ----> Here is where we will do the k8s deployments ----> Click on 'New App' ----> App Name: swiggy-app, Project name: default, Sync policy: Automatic, Source - Repo URL: <Repo URL> ----> Revision: HEAD, Path: ./ ----> Cluster URL: Select the one from dropdown, Namespace: default (If you want to deploy the pods in custom namespace, create that namespace and provide here) ----> Create ----> Click on the 'swiggy-app' ----> You can see the details of pods ----> kubectl get svc ----> Copy the load balancer url and access the app in new tab of browser ----> Lets say you want to change the image name in repo, you can change. Automatically you will see the modified app ----> Goto repo, change the image name, replicas count ----> Based on this everything will get updated in argocd ----> Goto Argocd ----> Click on 'sync' and 'snchronize' ----> Automatically the new app will get deployed. Here we dint used Jenkins but still we were able to automate the deployment process. 
+
+============
+Lets setup the Monitoring of this App
+Create a new t2.medium VM
+
+Now from monitoring VM we need to connect to Kubernetes cluster;
+
+Create an IAM Role (Role Name: monitoring-role) with below policies attached
+AmazonEKSClusterPolicy
+AmazonEKSWorkerNodePolicy
+AmazonEC2ContainerRegistryReadOnly
+
+Attach this role to Monitoring VM
+
+Verify IAM Role
+aws sts get-caller-identity
+If it returns ARN → ✅ working
+
+In the EKS-Client-VM ----> 
+Lets add the IAM role to aws-auth ConfigMap so that from Monitoring VM we can access the cluster;
+kubectl edit configmap aws-auth -n kube-system
+
+Add below role;
+Inside mapRoles, add this:
+
+- rolearn: arn:aws:iam::560185625463:role/monitoring-role
+  username: monitoring
+  groups:
+    - system:masters
+
+esc ----> :wq
+
+Now go to Monitoring VM -----> aws eks update-kubeconfig --region ap-south-1 --name kastro-cluster -----> kubectl get nodes ----> You should see nodes
+
+Install below tools and packages in the Monitoring VM ---->
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+kubectl create namespace monitoring
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring
+
+kubectl get pods -n monitoring ----> You will see some pods in pending. This is because, our cluster worker nodes are t2.medium which are not sufficient to handle additional pods ----> kubectl describe pod monitoring-grafana-6c7864bd45-bt2fk -n monitoring ----> Look under events, you will get to know the reason -----> Lets scale the worker nodes. Goto Autoscaling Group and increase the minimum and desired count to 4.
+
+kubectl get pods -n monitoring  ----> Automatially the pods comes in to the running state
+
+kubectl get svc -n monitoring ----> The service type of Prometheus and Grafana are ClusterIP. Lets patch to LoadBalancer, so that we can access in browser;
+
+kubectl patch svc monitoring-grafana -n monitoring \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+kubectl patch svc monitoring-kube-prometheus-prometheus -n monitoring \
+  -p '{"spec": {"type": "LoadBalancer"}}'
+
+kubectl get svc -n monitoring
+
+🌐 ACCESS IN BROWSER
+✅ Grafana
+http://<grafana-lb>
+✅ Prometheus
+http://<prometheus-lb>:9090
+
+Grafana user name: admin
+To get Grafana password
+kubectl get secret monitoring-grafana -n monitoring -o jsonpath="{.data.admin-password}" | base64 --decode
+
+Access the dashboards
+================================
+Now what we will do is;
+Generate CPU load on your pods
+See CPU spike in Grafana
+Create alert when CPU > 10%
+Send email notification
+
+🚀 STEP 1: GENERATE LOAD (STRESS TEST)
+🔹 Option A: Run temporary load pod
+kubectl run load-generator -n employee-dir --image=busybox -it -- /bin/sh
+🔹 Inside pod:
+while true; do wget -q -O- http://frontend-svc; done
+👉 This will hit your app continuously
+
+OR
+🔹 Option B (Better): Use curl loop
+If curl available:
+while true; do wget -q -O- http://employee-svc:5001/api/employees; done
+
+🚀 STEP 2: VERIFY IN GRAFANA
+🔹 Open Grafana
+Go to:
+👉 Dashboards →
+Search: Kubernetes / Compute Resources / Pods
+🔹 Filter:
+Namespace = employee-dir
+👉 You should see:
+CPU spike 📈
+Memory usage
+
+🚀 STEP 3: CREATE ALERT (PROMETHEUS RULE)
+🔹 Go to Grafana
+🎯 STEP-BY-STEP (FILL THIS EXACTLY)
+✅ STEP 1: Name: Employee Namespace CPU > 10%
+
+✅ STEP 2: Define Query (VERY IMPORTANT)
+Right now it shows “Select metric” — you need to switch to PromQL mode
+🔹 Do this:
+Click “Explain / Code / Builder toggle” → switch to CODE
+👉 Then paste:
+avg(rate(container_cpu_usage_seconds_total{namespace="employee-dir", image!=""}[2m])) * 100
+
+🔹 Click:
+Run queries
+👉 You should see graph 📈
+
+✅ STEP 3: Alert Condition
+Now configure:
+WHEN → Last()
+OF → Query A
+IS ABOVE → 10
+👉 Replace 0 with:
+10
+
+✅ STEP 4: Folder & Labels
+🔹 Folder:
+Click:
+New folder → monitoring-alerts
+🔹 Labels (optional but good):
+Add:
+severity = warning
+namespace = employee-dir
+
+✅ STEP 5: Evaluation Behavior
+🔹 Evaluation group:
+Click:
+New evaluation group → cpu-alert-group
+🔹 Set:
+Evaluate every → 1m
+Pending period → 2m
+Keep firing → 1m
+👉 Meaning:
+CPU must stay >10% for 2 minutes before alert fires
+
+✅ STEP 6: Notifications (IMPORTANT)
+🔹 Contact Point
+Click:
+View or create contact points
+➕ Create new:
+Type → Email
+Name → email-alert
+Email → your email
+👉 Save
+🔹 Come back and select:
+Contact point → email-alert
+
+✅ STEP 7: Message (OPTIONAL BUT NICE)
+🔹 Summary:
+CPU usage exceeded 10% in employee-dir namespace
+🔹 Description:
+CPU usage across pods in employee-dir namespace is above threshold (10%)
+✅ STEP 8: SAVE
+Click:
+Save
+
+🚀 STEP 9: TEST IT
+🔹 Generate load again:
+kubectl run load-generator -n employee-dir --image=busybox -it -- /bin/sh
+Inside:
+while true; do wget -q -O- http://employee-svc:5001/api/employees; done
+⏳ WAIT
+~2–3 minutes
+
+👉 Then:
+Alert status → Firing 🔥
+Email → received 📧
+
+✅ STEP 1: Edit Grafana ConfigMap
+
+Run:
+
+kubectl edit configmap monitoring-grafana -n monitoring
+✅ STEP 2: Add SMTP CONFIG
+
+Inside the file, find:
+
+data:
+  grafana.ini: |
+
+👉 Add this inside grafana.ini block:
+
+[smtp]
+enabled = true
+host = smtp.gmail.com:587
+user = your-email@gmail.com
+password = your-app-password
+from_address = your-email@gmail.com
+from_name = Grafana Alerts
+skip_verify = true
+startTLS_policy = OpportunisticStartTLS
+⚠️ IMPORTANT
+
+👉 Replace:
+
+your-email@gmail.com
+your-app-password
+
+👉 Use your Gmail App Password (NOT normal password)
+
+✅ STEP 3: Save & Exit
+✅ STEP 4: Restart Grafana
+kubectl rollout restart deployment monitoring-grafana -n monitoring
+⏳ Wait
+kubectl get pods -n monitoring -w
+
+👉 Wait until Grafana is Running
+
+✅ STEP 5: TEST EMAIL
+🔹 Go to Grafana
+
+👉 Alerting → Contact Points
+👉 Open email-alert
+
+🔹 Click:
+Test
+
+👉 You should receive email 📧
+
+🚨 IF EMAIL NOT RECEIVED
+
+Check logs:
+
+kubectl logs deployment/monitoring-grafana -n monitoring
+🔥 COMMON ISSUES
+❌ Gmail blocked
+
+👉 Fix:
+
+Enable 2FA
+Use App Password only
+❌ Wrong password
+
+👉 Must be 16-digit app password
+
+❌ Port blocked
+
+👉 Ensure:
+
+smtp.gmail.com:587
+🧠 FINAL FLOW
+Alert Rule → Contact Point → SMTP (Gmail) → Email

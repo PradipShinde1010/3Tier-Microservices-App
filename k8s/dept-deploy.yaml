@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dept-svc
+  namespace: employee-dir
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: dept-svc
+  template:
+    metadata:
+      labels:
+        app: dept-svc
+    spec:
+      containers:
+        - name: dept-svc
+          image: kastrov/dept-svc:PLACEHOLDER
+          ports:
+            - containerPort: 5002
+          env:
+            - name: MONGO_URI
+              valueFrom:
+                secretKeyRef:
+                  name: mongo-secret
+                  key: mongo-uri
+            - name: PORT
+              value: "5002"
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "250m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dept-svc
+  namespace: employee-dir
+spec:
+  selector:
+    app: dept-svc
+  ports:
+    - port: 5002
+      targetPort: 5002
+  type: ClusterIP
